@@ -413,6 +413,71 @@ class TestRunGAErrorHandling:
         assert os.path.exists(errors_path)
 
 
+class TestRunGAKeyboardInterrupt:
+    def test_interrupted_run_keeps_actual_best_not_seed_placeholder(self, toy_schema, tmp_path):
+        # Regression test: a KeyboardInterrupt raised mid-GA must not fall
+        # through to the pre-loop seed placeholder (all-zero chromosome,
+        # score 0.0) -- it must recover the actual best individual found
+        # across whatever generations completed before the interrupt.
+        codec = RuleChromosomeCodec(toy_schema)
+        pop_size, n_gen = 8, 20
+        calls = {'n': 0}
+        # Interrupt partway through generation 2, after generation 1 has
+        # definitely completed and been recorded in the callback's history.
+        raise_after = pop_size + 2
+
+        def _interrupting_fitness(chrom: np.ndarray) -> float:
+            calls['n'] += 1
+            if calls['n'] > raise_after:
+                raise KeyboardInterrupt()
+            return float(len(codec.decode(chrom)))
+
+        final_eval_calls = []
+
+        def _final_eval(best_chromosome, run_dir):
+            final_eval_calls.append(np.array(best_chromosome, copy=True))
+
+        result = run_ga(
+            schema=toy_schema,
+            fitness_fn=_interrupting_fitness,
+            pop_size=pop_size,
+            n_gen=n_gen,
+            run_dir_base=str(tmp_path),
+            run_name='interrupted_test',
+            verbose=False,
+            final_eval_fn=_final_eval,
+        )
+
+        # The interrupt actually fired, and at least one generation ran.
+        assert calls['n'] > raise_after
+        assert len(result['history']) >= 1
+        assert len(result['history']) < n_gen
+
+        # best_score/best_chromosome must reflect the real best individual
+        # found (not the seed placeholder: all-zero chromosome, score 0.0).
+        assert result['best_score'] > 0.0
+        assert not np.allclose(result['best_chromosome'], 0.0)
+
+        # The fitness function counts active rules, so a correctly-recovered
+        # best_chromosome must decode to exactly best_score rules.
+        assert len(result['best_rules']) == result['best_score']
+
+        # Post-interrupt code path behaves like a normal completion: final
+        # evaluation runs against the recovered best, not the placeholder.
+        assert len(final_eval_calls) == 1
+        np.testing.assert_array_equal(final_eval_calls[0], result['best_chromosome'])
+
+        # Artefacts on disk reflect the recovered best too.
+        run_dir = result['run_dir']
+        with open(os.path.join(run_dir, 'ga_best_rules.json')) as f:
+            saved = json.load(f)
+        assert saved['score'] == result['best_score']
+        assert saved['n_rules'] == len(result['best_rules'])
+        with open(os.path.join(run_dir, 'ga_history.json')) as f:
+            saved_history = json.load(f)
+        assert len(saved_history) == len(result['history'])
+
+
 class TestRulesToReadable:
     def test_labels_and_consequent(self, toy_schema):
         rf = RuleFactory(toy_schema)

@@ -259,6 +259,14 @@ def _make_callback(codec: RuleChromosomeCodec, rule_len: int, mf_len: int, verbo
         def __init__(self):
             super().__init__()
             self.history: list = []
+            # Running best across all generations seen so far, kept separate
+            # from `history` (which is JSON-serialised to ga_history.json and
+            # must stay chromosome-free) -- this is what a KeyboardInterrupt
+            # handler falls back on, since pymoo's own elitism means the
+            # best-so-far chromosome may or may not still be in the final
+            # population depending on when the interrupt lands.
+            self.best_chromosome: Optional[np.ndarray] = None
+            self.best_score: float = -np.inf
 
         def notify(self, algorithm):
             F = algorithm.pop.get('F')
@@ -278,6 +286,10 @@ def _make_callback(codec: RuleChromosomeCodec, rule_len: int, mf_len: int, verbo
                 'n_rules': n_rules,
             }
             self.history.append(entry)
+
+            if best_score > self.best_score:
+                self.best_score = best_score
+                self.best_chromosome = np.array(best_chrom, copy=True)
 
             if verbose:
                 print(
@@ -538,14 +550,12 @@ def run_ga(
         best_chromosome = result.X.flatten()
         best_score = float(-result.F.flatten()[0])
     except KeyboardInterrupt:
-        if logger.history:
-            best_gen_idx = max(
-                range(len(logger.history)),
-                key=lambda i: logger.history[i]['best_score'],
-            )
+        if logger.best_chromosome is not None:
+            best_chromosome = logger.best_chromosome
+            best_score = logger.best_score
             if verbose:
                 print(f"\n[Interrupted at gen {logger.history[-1]['gen']}]")
-                print(f"Best score so far: {logger.history[best_gen_idx]['best_score']:.4f}")
+                print(f"Best score so far: {best_score:.4f}")
 
     # Failure-rate reporting: pop_size * n_gen is the number of fitness
     # evaluations the GA *intended* to run -- an approximation (pymoo's
