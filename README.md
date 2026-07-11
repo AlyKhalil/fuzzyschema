@@ -223,7 +223,8 @@ result = run_ga(
     pop_size=30,
     n_gen=50,
 )
-# result: best_chromosome, best_score, best_rules, history, run_dir
+# result: best_chromosome, best_score, best_rules, history, run_dir,
+#         n_failures, failure_rate
 ```
 
 `fitness_fn` receives the raw chromosome array and is entirely responsible
@@ -258,7 +259,49 @@ no `ga_best_mf_params.json` artefact written.
 
 Artefacts saved per run, under `run_dir_base/run_name/`:
 `ga_config.json`, `ga_best_chromosome.npy`, `ga_best_rules.json`,
-`ga_history.json`, and — MF-optimization mode only — `ga_best_mf_params.json`.
+`ga_history.json`, `ga_errors.jsonl` (only if any fitness_fn call failed —
+see below), and — MF-optimization mode only — `ga_best_mf_params.json`.
+
+**CPU process-parallelism:** pass `n_jobs` to evaluate individuals across
+multiple processes via pymoo's `JoblibParallelization` instead of one at a
+time on a single core:
+
+```python
+result = run_ga(schema=schema, fitness_fn=my_fitness_fn, n_jobs=4)   # 4 worker processes
+result = run_ga(schema=schema, fitness_fn=my_fitness_fn, n_jobs=-1)  # all available cores
+```
+
+`n_jobs=None` (the default) is unchanged, fully serial behavior — no
+`elementwise_runner` is passed to pymoo at all. Because joblib's `loky`
+backend pickles `fitness_fn` to ship it to worker processes, a `fitness_fn`
+closure that holds unpicklable state will fail at pickle time when
+`n_jobs` is set, not at fitness-evaluation time.
+
+**Error handling:** each `fitness_fn(x)` call is wrapped in a try/except.
+A failing individual is scored `0.0` rather than crashing the run, and the
+failure is appended as one JSON line to `run_dir/ga_errors.jsonl`:
+
+```json
+{"timestamp": "...", "pid": 1234, "chromosome": [...], "exception_type": "ValueError", "message": "...", "traceback": "..."}
+```
+
+After the GA completes, `result['n_failures']` / `result['failure_rate']`
+report how many calls failed (`failure_rate = n_failures / (pop_size *
+n_gen)`, approximate). If `failure_rate` exceeds `failure_rate_warn_threshold`
+(default `0.2`, pass to `run_ga` to tune per-call), a warning is printed
+(not raised) — this always prints regardless of `verbose`, since a
+degraded-quality run is more important to surface than routine progress
+logging is to suppress.
+
+**Pre-flight smoke test:** by default (`smoke_test=True`), `run_ga` calls
+`fitness_fn` once, synchronously and outside any try/except, on the seed
+chromosome before building the GA at all — a fundamentally broken
+`fitness_fn` raises immediately instead of only surfacing after a full run
+of meaningless all-zero scores. The smoke test is skipped automatically
+when there's no seed chromosome to test with (both `rules_fn` and
+`mf_seed_fn` are `None`), and can be disabled outright with
+`smoke_test=False` if the extra evaluation's cost is a real problem for a
+given `fitness_fn`.
 
 ## Known ex_fuzzy issues worked around
 

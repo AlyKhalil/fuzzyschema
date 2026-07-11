@@ -24,6 +24,36 @@ from ex_fuzzy.fuzzy_sets import IVFS, fuzzyVariable
 from fuzzyschema.variable_config import Schema, Trap, check_trap
 
 
+# ── Minimum UMF width (GA-mutation repair only, see _make_from_vector_it2) ────
+
+# Fraction of a field's own domain width used as the minimum UMF trapezoid
+# width floor. Domain-relative, not an absolute constant: variable domains
+# vary wildly in scale across a schema (e.g. lidar_density's (0.0, 12.0) vs
+# lidar_conf's (0.0, 1.0)) -- a fixed absolute epsilon would be negligible
+# for the former and oversized for the latter. 0.1% is small enough to be a
+# no-op on any trapezoid with a normal, non-degenerate spread (real UMF
+# widths are expected to be orders of magnitude larger relative to the
+# domain), but large enough to pull a GA-mutated near-zero-width UMF (all 4
+# raw genes landing within noise of each other) away from true degeneracy.
+_MIN_WIDTH_FRACTION = 1e-3
+
+
+def _widen_if_degenerate(a: float, b: float, c: float, d: float,
+                          epsilon: float, dom_max: float):
+    """
+    If the trapezoid's overall width (d - a) is below epsilon, push d out to
+    a + epsilon, clamped to the variable's domain max, so the UMF -- and
+    everything derived from it downstream (the LMF via containment
+    clamping, check_trap's a<=b<=c<=d) -- never collapses to a degenerate
+    zero/near-zero-width shape. Only d moves; a/b/c are left untouched, so
+    ordering (a<=b<=c<=new_d) is preserved for free, since new_d >= old
+    d >= c by construction (widening only ever increases d).
+    """
+    if d - a < epsilon:
+        d = min(a + epsilon, dom_max)
+    return a, b, c, d
+
+
 # ── Containment validation ───────────────────────────────────────────────────
 
 def _check_containment(term: str, umf: Trap, lmf: Trap) -> None:
@@ -63,13 +93,19 @@ def _post_init_it2(self) -> None:
                 )
 
 
-def _make_from_vector_it2(pairs: dict):
+def _make_from_vector_it2(pairs: dict, field_domain: dict):
     """Build a from_vector classmethod body closing over this schema's
-    umf_field -> lmf_field pairing (computed once at class-build time).
+    umf_field -> lmf_field pairing and per-field domains (both computed
+    once at class-build time).
 
-    `pairs` is baked in via closure so the returned function can have the
-    plain (cls, v) signature every from_vector needs, while still knowing
-    which fields pair up for *this* schema.
+    `pairs`/`field_domain` are baked in via closure so the returned function
+    can have the plain (cls, v) signature every from_vector needs, while
+    still knowing which fields pair up and each field's domain (for the
+    minimum-width epsilon, itself domain-relative -- see
+    _MIN_WIDTH_FRACTION) for *this* schema. field_domain is keyed by the
+    bare term field name (schema.field_domains()'s own convention), so a
+    field's own '_umf'/'_lmf' suffix is stripped before lookup, same
+    pattern chromosome.py's mf_chromosome_bounds uses.
     """
 
     def _from_vector(cls, v: np.ndarray):
@@ -90,6 +126,16 @@ def _make_from_vector_it2(pairs: dict):
             # UMF's own 4 genes sort independently -- guarantees a valid
             # trapezoid on its own, regardless of what the raw floats were.
             a_u, b_u, c_u, d_u = sorted(v[i_u * 4:(i_u + 1) * 4])
+
+            # GA mutation can legally land all 4 raw genes within noise of
+            # each other, sorting into a valid-but-degenerate (zero/near-
+            # zero-width) UMF. Widen it here, before the LMF is derived from
+            # it below, so the LMF's containment clamp (and check_trap's
+            # ordering check, which every field goes through in
+            # __post_init__) never has to cope with a degenerate UMF.
+            dom_min, dom_max = field_domain[umf_name[:-4]]
+            epsilon = _MIN_WIDTH_FRACTION * (dom_max - dom_min)
+            a_u, b_u, c_u, d_u = _widen_if_degenerate(a_u, b_u, c_u, d_u, epsilon, dom_max)
 
             # LMF is built as a chain anchored to the now-fixed UMF: each
             # point is clamped into the range implied by containment (must
@@ -119,11 +165,18 @@ def _make_from_vector_it2(pairs: dict):
 
         # Any field with no pairing partner (shouldn't normally happen, but
         # handled defensively) just gets its own 4 floats sorted independently
-        # -- no containment relationship to preserve.
+        # -- no containment relationship to preserve. Same degenerate-width
+        # guard as the paired UMF branch above -- a lone field is just as
+        # capable of landing all 4 genes within noise of each other.
         for fn in field_names:
             if fn not in processed:
                 i = field_idx[fn]
-                trap_dict[fn] = tuple(float(x) for x in sorted(v[i * 4:(i + 1) * 4]))
+                a, b, c, d = sorted(v[i * 4:(i + 1) * 4])
+                base = fn[:-4] if fn.endswith(('_umf', '_lmf')) else fn
+                dom_min, dom_max = field_domain[base]
+                epsilon = _MIN_WIDTH_FRACTION * (dom_max - dom_min)
+                a, b, c, d = _widen_if_degenerate(a, b, c, d, epsilon, dom_max)
+                trap_dict[fn] = (float(a), float(b), float(c), float(d))
 
         return cls(**trap_dict)
 
@@ -172,7 +225,7 @@ def build_it2_mf_params_class(schema: Schema, class_name: str = "IT2MFParams") -
         fields,
         namespace={
             "__post_init__": _post_init_it2,
-            "from_vector": classmethod(_make_from_vector_it2(pairs)),
+            "from_vector": classmethod(_make_from_vector_it2(pairs, schema.field_domains())),
             "to_vector": _make_to_vector_it2(pairs),
         },
     )

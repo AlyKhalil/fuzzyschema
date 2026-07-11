@@ -61,6 +61,7 @@ from __future__ import annotations
 
 import json
 import os
+import traceback
 from datetime import datetime
 from typing import Any, Callable, Optional, Type
 
@@ -115,28 +116,72 @@ def _mf_params_to_readable(mf_params) -> dict:
     return {f.name: list(getattr(mf_params, f.name)) for f in dataclasses.fields(mf_params)}
 
 
+# ── Error logging ──────────────────────────────────────────────────────────────
+
+def _log_ga_error(run_dir: str, chromosome: np.ndarray, exc: Exception) -> None:
+    """
+    Append one JSON line describing a failed fitness_fn call to
+    run_dir/ga_errors.jsonl (mode 'a', one write() per line -- no locking
+    library needed at this volume). Called from inside _evaluate, which may
+    run in a joblib worker process, so this must be self-contained (no
+    shared in-memory state) and safe to call from multiple processes
+    appending to the same file concurrently.
+    """
+    entry = {
+        'timestamp': datetime.now().isoformat(timespec='seconds'),
+        'pid': os.getpid(),
+        'chromosome': np.asarray(chromosome).tolist(),
+        'exception_type': type(exc).__name__,
+        'message': str(exc),
+        'traceback': traceback.format_exc(),
+    }
+    with open(os.path.join(run_dir, 'ga_errors.jsonl'), 'a') as f:
+        f.write(json.dumps(entry) + '\n')
+
+
 # ── pymoo problem definition ──────────────────────────────────────────────────
 
 def _make_problem(n_var: int, lower: np.ndarray, upper: np.ndarray,
-                   fitness_fn: Callable[[np.ndarray], float]):
+                   fitness_fn: Callable[[np.ndarray], float], run_dir: str,
+                   elementwise_runner=None):
     """pymoo minimises by convention, so we negate the fitness: F = -score.
 
     n_var/lower/upper are passed in already-combined (rule bounds alone, or
     rule bounds concatenated with MF bounds) so this function itself has no
     branching on whether MF-optimisation is active -- that decision is made
     once, by the caller, when it builds these three arguments.
+
+    A fitness_fn exception is caught here (not left to crash the run): the
+    individual is scored 0.0 and the failure is appended to
+    run_dir/ga_errors.jsonl -- one bad chromosome should not lose an entire
+    multi-hour GA run, but the failure must still be visible afterwards via
+    the failure-rate summary.
+
+    elementwise_runner, when given (a JoblibParallelization instance),
+    is passed straight through to pymoo's Problem base. Left at its default
+    (None) here, pymoo's own serial LoopedElementwiseEvaluation is used
+    instead -- i.e. n_jobs=None in run_ga must reach this function as
+    elementwise_runner=None, not some other "serial" sentinel, for
+    byte-for-byte backward compatibility with pre-parallelism behaviour.
     """
     from pymoo.core.problem import ElementwiseProblem
 
     class _CombinedProblem(ElementwiseProblem):
         def __init__(self):
-            super().__init__(
+            kwargs = dict(
                 n_var=n_var, n_obj=1, xl=lower, xu=upper,
                 elementwise_evaluation=True,
             )
+            if elementwise_runner is not None:
+                kwargs['elementwise_runner'] = elementwise_runner
+            super().__init__(**kwargs)
 
         def _evaluate(self, x, out, *args, **kwargs):
-            score = fitness_fn(x)
+            try:
+                score = fitness_fn(x)
+            except Exception as exc:
+                score = 0.0
+                _log_ga_error(run_dir, x, exc)
             out['F'] = -score
 
     return _CombinedProblem()
@@ -298,6 +343,9 @@ def run_ga(
     verbose: bool = True,
     final_eval_fn: Optional[Callable[[np.ndarray, str], Any]] = None,
     extra_config: Optional[dict] = None,
+    n_jobs: Optional[int] = None,
+    smoke_test: bool = True,
+    failure_rate_warn_threshold: float = 0.2,
 ) -> dict:
     """
     Run GA optimisation of a rule-only chromosome (or, with mf_params_cls
@@ -339,16 +387,49 @@ def run_ga(
         extra_config:   Extra key/value pairs to record in ga_config.json
                         (e.g. dataset paths) for reproducibility -- purely
                         informational, not used by the GA itself.
+        n_jobs:         CPU process-parallelism for fitness evaluation via
+                        pymoo's JoblibParallelization. None (default): fully
+                        serial, no elementwise_runner passed -- unchanged,
+                        byte-for-byte backward-compatible behaviour. An
+                        int > 0: that many joblib worker processes. -1: all
+                        available cores. Note: joblib's 'loky' backend
+                        pickles fitness_fn (via cloudpickle) to ship it to
+                        worker processes -- if fitness_fn closes over
+                        unpicklable state, that fails at pickle time rather
+                        than at fitness-evaluation time; this module does
+                        not work around that, it surfaces as-is.
+        smoke_test:     When True (default), fitness_fn is called once,
+                        synchronously, on the seed chromosome before the
+                        pymoo problem/algorithm are built, with no
+                        try/except -- a fundamentally broken fitness_fn
+                        raises immediately instead of silently producing a
+                        full run of meaningless all-zero scores. Skipped
+                        automatically if there is no seed chromosome
+                        available (both rules_fn and mf_seed_fn are None).
+        failure_rate_warn_threshold:
+                        If, after the GA completes, the fraction of
+                        fitness_fn calls that raised (logged to
+                        run_dir/ga_errors.jsonl) exceeds this threshold, a
+                        warning is printed (not raised). A parameter, not a
+                        hardcoded constant, so callers can tune it per
+                        fitness_fn without touching this module.
 
     Returns:
         dict with keys: best_chromosome, best_score, best_rules, history,
-        run_dir, and (only when mf_params_cls is set) best_mf_params -- the
-        decoded mf_params_cls instance for the best chromosome found.
+        run_dir, n_failures, failure_rate, and (only when mf_params_cls is
+        set) best_mf_params -- the decoded mf_params_cls instance for the
+        best chromosome found.
+
+        On failure, individual fitness_fn exceptions are caught per-call
+        (scored 0.0) and appended to run_dir/ga_errors.jsonl -- one bad
+        chromosome does not abort the run; n_failures/failure_rate in the
+        returned dict summarise how many did.
     """
     from pymoo.algorithms.soo.nonconvex.ga import GA
     from pymoo.operators.crossover.pntx import SinglePointCrossover
     from pymoo.operators.mutation.pm import PolynomialMutation
     from pymoo.optimize import minimize
+    from pymoo.parallelization.joblib import JoblibParallelization
 
     if mf_seed_fn is not None and mf_params_cls is None:
         raise ValueError(
@@ -391,6 +472,7 @@ def run_ga(
         'optimize_mf_params': mf_params_cls is not None,
         'seeded_from_rules_fn': rules_fn is not None,
         'seeded_from_mf_seed_fn': mf_seed_fn is not None,
+        'n_jobs': n_jobs,
         **(extra_config or {}),
     }
 
@@ -407,7 +489,34 @@ def run_ga(
         print(f"  Artefacts:  {run_dir}/")
         print(f"{'='*60}\n")
 
-    problem = _make_problem(n_var, lower, upper, fitness_fn)
+    if rules_fn is not None:
+        rule_seed = codec.expert_chromosome(rules_fn)
+    else:
+        rule_seed = np.zeros(codec.chrom_len)
+    if mf_params_cls is not None:
+        mf_seed = mf_seed_fn().to_vector() if mf_seed_fn is not None else np.zeros(mf_len)
+        best_chromosome = build_combined_chromosome(rule_seed, mf_seed)
+    else:
+        best_chromosome = rule_seed
+    best_score = 0.0
+
+    # Pre-flight smoke test: call fitness_fn once, synchronously, on the seed
+    # chromosome, deliberately outside any try/except -- a fundamentally
+    # broken fitness_fn should raise here and abort immediately, rather than
+    # burning a full run producing meaningless all-zero scores that only
+    # surface as a 100% failure rate after the fact. Only meaningful when a
+    # seed chromosome actually came from somewhere (rules_fn/mf_seed_fn); an
+    # all-zeros default chromosome isn't representative of what the GA will
+    # actually evaluate, so there's nothing useful to smoke-test.
+    if smoke_test and (rules_fn is not None or mf_seed_fn is not None):
+        if verbose:
+            print("Running pre-flight smoke test on seed chromosome...")
+        fitness_fn(best_chromosome)
+
+    elementwise_runner = JoblibParallelization(n_jobs=n_jobs) if n_jobs is not None else None
+
+    problem = _make_problem(n_var, lower, upper, fitness_fn, run_dir,
+                             elementwise_runner=elementwise_runner)
     sampling = _make_sampling(
         codec, rules_fn, mf_params_cls, mf_seed_fn, mf_lower, mf_upper, pop_size, seed,
     )
@@ -420,17 +529,6 @@ def run_ga(
         mutation=PolynomialMutation(prob=1.0 / n_var, eta=mutation_eta),
         eliminate_duplicates=True,
     )
-
-    if rules_fn is not None:
-        rule_seed = codec.expert_chromosome(rules_fn)
-    else:
-        rule_seed = np.zeros(codec.chrom_len)
-    if mf_params_cls is not None:
-        mf_seed = mf_seed_fn().to_vector() if mf_seed_fn is not None else np.zeros(mf_len)
-        best_chromosome = build_combined_chromosome(rule_seed, mf_seed)
-    else:
-        best_chromosome = rule_seed
-    best_score = 0.0
 
     try:
         result = minimize(
@@ -448,6 +546,19 @@ def run_ga(
             if verbose:
                 print(f"\n[Interrupted at gen {logger.history[-1]['gen']}]")
                 print(f"Best score so far: {logger.history[best_gen_idx]['best_score']:.4f}")
+
+    # Failure-rate reporting: pop_size * n_gen is the number of fitness
+    # evaluations the GA *intended* to run -- an approximation (pymoo's
+    # eliminate_duplicates and the seeded individual mean the true count can
+    # differ slightly), which is acceptable here since this is a summary
+    # statistic, not something the GA loop depends on.
+    errors_path = os.path.join(run_dir, 'ga_errors.jsonl')
+    n_failures = 0
+    if os.path.exists(errors_path):
+        with open(errors_path) as f:
+            n_failures = sum(1 for _ in f)
+    total_evals = pop_size * n_gen
+    failure_rate = (n_failures / total_evals) if total_evals > 0 else 0.0
 
     rule_part, mf_part = split_combined_chromosome(best_chromosome, codec.chrom_len, mf_len)
     best_rules = codec.decode(rule_part)
@@ -472,8 +583,23 @@ def run_ga(
         print("Optimisation complete")
         print(f"  Best score: {best_score:.4f}")
         print(f"  Rules:      {len(best_rules)}")
+        print(f"  Failures:   {n_failures} ({failure_rate:.1%})")
         print(f"  Artefacts:  {run_dir}/")
         print(f"{'='*60}")
+
+    # Always printed, regardless of verbose: a failure-rate warning is
+    # actionable information about run quality, not routine progress
+    # logging, so it shouldn't be silenced by verbose=False the way the
+    # summary above is.
+    if failure_rate > failure_rate_warn_threshold:
+        print(
+            f"\n{'!' * 60}\n"
+            f"WARNING: fitness_fn failure rate {failure_rate:.1%} exceeds "
+            f"failure_rate_warn_threshold={failure_rate_warn_threshold:.1%} "
+            f"({n_failures} failures / ~{total_evals} evaluations). "
+            f"See {errors_path} for details.\n"
+            f"{'!' * 60}"
+        )
 
     result_dict = {
         'best_chromosome': best_chromosome,
@@ -481,6 +607,8 @@ def run_ga(
         'best_rules': best_rules,
         'history': logger.history,
         'run_dir': run_dir,
+        'n_failures': n_failures,
+        'failure_rate': failure_rate,
     }
     if mf_params_cls is not None:
         result_dict['best_mf_params'] = best_mf_params

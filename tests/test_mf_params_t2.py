@@ -195,6 +195,45 @@ class TestToVectorIT2:
                 check_trap(f.name, getattr(it2, f.name))
 
 
+class TestFromVectorMinWidthClamp:
+    def test_degenerate_umf_genes_widened_to_at_least_epsilon(self, toy_schema):
+        # All 4 raw genes for x1_low_umf land within noise of each other --
+        # exactly the shape GA mutation can legally produce (see
+        # GA_ROBUSTNESS_HANDOFF.md Phase 2). x1's domain is (0.0, 10.0), so
+        # the domain-relative floor is epsilon = 1e-3 * 10.0 = 0.01.
+        IT2 = build_it2_mf_params_class(toy_schema)
+        field_names = [f.name for f in dataclasses.fields(IT2)]
+        n = len(field_names)
+        v = np.tile([1.0, 2.0, 3.0, 4.0], n)  # everything else non-degenerate
+        i = field_names.index('x1_low_umf')
+        v[i * 4:(i + 1) * 4] = [5.0, 5.0, 5.0, 5.0]  # fully degenerate UMF genes
+
+        it2 = IT2.from_vector(v)  # must not raise -- __post_init__ validates
+
+        a, b, c, d = it2.x1_low_umf
+        epsilon = 1e-3 * (10.0 - 0.0)
+        assert d - a >= epsilon - 1e-12
+        check_trap('x1_low_umf', it2.x1_low_umf)  # still a valid trapezoid
+        # UMF must still contain its paired LMF after widening.
+        lmf = it2.x1_low_lmf
+        assert a <= lmf[0] and b <= lmf[1] and c >= lmf[2] and d >= lmf[3]
+
+    def test_non_degenerate_umf_round_trips_unchanged(self, toy_schema):
+        # Epsilon must be a no-op for normal, comfortably-wide trapezoids --
+        # not just a rejection of the degenerate ones.
+        IT2 = build_it2_mf_params_class(toy_schema)
+        T1 = build_mf_params_class(toy_schema)
+        base = make_it2_from_t1(toy_schema, T1(), delta=0.1, it2_cls=IT2)
+        it2 = dataclasses.replace(
+            base,
+            x1_low_umf=(0.0, 1.0, 4.0, 6.0),
+            x1_low_lmf=(0.5, 1.5, 3.5, 5.5),
+        )
+        it2_roundtrip = IT2.from_vector(it2.to_vector())
+        assert it2_roundtrip.x1_low_umf == pytest.approx(it2.x1_low_umf)
+        assert it2_roundtrip.x1_low_lmf == pytest.approx(it2.x1_low_lmf)
+
+
 class TestGetAntecedentsT2:
     def test_returns_ivfs_variables(self, toy_schema):
         T1 = build_mf_params_class(toy_schema)

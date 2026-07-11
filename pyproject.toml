@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fuzzyschema"
 version = "0.1.0"
-dependencies = ["ex-fuzzy", "numpy", "pymoo"]
+dependencies = ["ex-fuzzy", "numpy", "pymoo>=0.6.0", "joblib"]
 
 [tool.setuptools]
 packages = ["fuzzyschema"]

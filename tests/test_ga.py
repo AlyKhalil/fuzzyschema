@@ -47,6 +47,7 @@ class TestRunGA:
         )
         assert set(result.keys()) == {
             'best_chromosome', 'best_score', 'best_rules', 'history', 'run_dir',
+            'n_failures', 'failure_rate',
         }
         assert len(result['best_chromosome']) == codec.chrom_len
         assert len(result['history']) == 3
@@ -155,7 +156,7 @@ class TestRunGAWithMFOptimization:
         # rule-only mode's key set plus best_mf_params, nothing else.
         assert set(result.keys()) == {
             'best_chromosome', 'best_score', 'best_rules', 'history', 'run_dir',
-            'best_mf_params',
+            'n_failures', 'failure_rate', 'best_mf_params',
         }
         assert len(result['best_chromosome']) == codec.chrom_len + len(mf_lower)
         assert isinstance(result['best_mf_params'], T1)
@@ -278,6 +279,138 @@ class TestRunGAWithMFOptimization:
         )
         mf_path = os.path.join(result['run_dir'], 'ga_best_mf_params.json')
         assert not os.path.exists(mf_path)
+
+
+class TestRunGAParallelism:
+    def test_n_jobs_none_default_matches_explicit_none(self, toy_schema, tmp_path):
+        # n_jobs=None must be indistinguishable from not passing n_jobs at
+        # all -- the backward-compat guarantee for existing callers.
+        codec = RuleChromosomeCodec(toy_schema)
+        common = dict(
+            schema=toy_schema,
+            fitness_fn=_n_active_rules_fitness(codec),
+            pop_size=8,
+            n_gen=3,
+            seed=7,
+            run_dir_base=str(tmp_path),
+            verbose=False,
+        )
+        result_default = run_ga(run_name='n_jobs_omitted', **common)
+        result_explicit_none = run_ga(run_name='n_jobs_none', n_jobs=None, **common)
+        assert result_default['best_score'] == result_explicit_none['best_score']
+        np.testing.assert_array_equal(
+            result_default['best_chromosome'], result_explicit_none['best_chromosome'],
+        )
+
+    def test_n_jobs_2_matches_serial_result(self, toy_schema, tmp_path):
+        # Parallelism changes wall-clock, not the optimisation outcome --
+        # same seed + deterministic fitness_fn must find the same best
+        # chromosome whether evaluated serially or across 2 joblib workers.
+        codec = RuleChromosomeCodec(toy_schema)
+        common = dict(
+            schema=toy_schema,
+            fitness_fn=_n_active_rules_fitness(codec),
+            pop_size=8,
+            n_gen=3,
+            seed=7,
+            run_dir_base=str(tmp_path),
+            verbose=False,
+        )
+        serial = run_ga(run_name='serial', n_jobs=None, **common)
+        parallel = run_ga(run_name='parallel', n_jobs=2, **common)
+        assert serial['best_score'] == parallel['best_score']
+        np.testing.assert_array_equal(serial['best_chromosome'], parallel['best_chromosome'])
+
+
+class TestRunGAErrorHandling:
+    def test_fitness_fn_exception_does_not_crash_run_and_reports_failures(self, toy_schema, tmp_path):
+        codec = RuleChromosomeCodec(toy_schema)
+
+        def _flaky_fitness(chrom: np.ndarray) -> float:
+            if float(chrom[0]) >= 1.0:
+                raise ValueError("bad chromosome")
+            return float(len(codec.decode(chrom)))
+
+        pop_size, n_gen = 8, 3
+        result = run_ga(
+            schema=toy_schema,
+            fitness_fn=_flaky_fitness,
+            pop_size=pop_size,
+            n_gen=n_gen,
+            run_dir_base=str(tmp_path),
+            run_name='flaky_test',
+            verbose=False,
+        )
+        errors_path = os.path.join(result['run_dir'], 'ga_errors.jsonl')
+        assert os.path.exists(errors_path)
+        with open(errors_path) as f:
+            lines = [json.loads(line) for line in f if line.strip()]
+        assert len(lines) > 0
+        assert lines[0]['exception_type'] == 'ValueError'
+        assert lines[0]['message'] == 'bad chromosome'
+        assert set(lines[0].keys()) == {
+            'timestamp', 'pid', 'chromosome', 'exception_type', 'message', 'traceback',
+        }
+        assert result['n_failures'] == len(lines)
+        assert result['failure_rate'] == pytest.approx(len(lines) / (pop_size * n_gen))
+
+    def test_always_raising_fitness_fn_triggers_smoke_test_and_raises_immediately(self, toy_schema, tmp_path):
+        rf = RuleFactory(toy_schema)
+        rules = [rf.rule(x1=0, x2=0, out=0)]
+        calls = []
+
+        def _always_raises(chrom: np.ndarray) -> float:
+            calls.append(chrom)
+            raise RuntimeError("fitness_fn is fundamentally broken")
+
+        with pytest.raises(RuntimeError, match="fundamentally broken"):
+            run_ga(
+                schema=toy_schema,
+                fitness_fn=_always_raises,
+                rules_fn=lambda: rules,
+                pop_size=8,
+                n_gen=3,
+                run_dir_base=str(tmp_path),
+                run_name='smoke_fail_test',
+                verbose=False,
+            )
+        # Smoke test calls fitness_fn exactly once, then raises before the
+        # pymoo problem/algorithm are even built -- no generations ran.
+        assert len(calls) == 1
+        run_dir = os.path.join(str(tmp_path), 'smoke_fail_test')
+        assert not os.path.exists(os.path.join(run_dir, 'ga_history.json'))
+        assert not os.path.exists(os.path.join(run_dir, 'ga_errors.jsonl'))
+
+    def test_smoke_test_false_skips_preflight_and_proceeds_into_ga_loop(self, toy_schema, tmp_path, capsys):
+        rf = RuleFactory(toy_schema)
+        rules = [rf.rule(x1=0, x2=0, out=0)]
+        calls = []
+
+        def _always_raises(chrom: np.ndarray) -> float:
+            calls.append(chrom)
+            raise RuntimeError("fitness_fn is fundamentally broken")
+
+        pop_size, n_gen = 6, 2
+        result = run_ga(
+            schema=toy_schema,
+            fitness_fn=_always_raises,
+            rules_fn=lambda: rules,
+            pop_size=pop_size,
+            n_gen=n_gen,
+            run_dir_base=str(tmp_path),
+            run_name='smoke_disabled_test',
+            verbose=False,
+            smoke_test=False,
+        )
+        captured = capsys.readouterr()
+        # Proceeded well past the single smoke-test-style call -- every
+        # individual, every generation, was actually evaluated (and failed).
+        assert len(calls) > 1
+        assert result['n_failures'] == len(calls)
+        assert result['failure_rate'] == pytest.approx(len(calls) / (pop_size * n_gen))
+        assert 'WARNING' in captured.out
+        errors_path = os.path.join(result['run_dir'], 'ga_errors.jsonl')
+        assert os.path.exists(errors_path)
 
 
 class TestRulesToReadable:
