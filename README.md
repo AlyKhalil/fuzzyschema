@@ -29,9 +29,10 @@ their domains, and their linguistic terms), `fuzzyschema`:
   fitness function you supply, optimizing rules only, MF parameters only,
   or both together, symmetrically for T1 or IT2.
 - Runs FLS inference (Mamdani, single shared rule base, Karnik-Mendel
-  defuzzification for IT2) via a small, direct engine that works around two
-  bugs found in `ex_fuzzy`'s own KM implementation (see [Known ex_fuzzy
-  issues](#known-ex_fuzzy-issues-worked-around)).
+  defuzzification for IT2) via a small, vectorized engine built directly on
+  `ex_fuzzy`'s antecedent-membership computation, returning a per-sample
+  score (`NaN` where no rule fired) rather than a single batch-aggregated
+  value.
 
 The library only knows about *structure* — variables, domains, terms,
 chromosomes. It has no knowledge of any specific application's rule
@@ -40,15 +41,20 @@ every entry point (`fitness_fn`, `rules_fn`, etc.).
 
 ## Why this exists
 
-`ex_fuzzy` supplies correct low-level fuzzy-set math, but every example
-wires up variables, membership functions, and its own genetic tuner by
-hand, per script. Its built-in optimizer (`evolutionary_fit.py`) is also
-architecturally tied to classification — every rule's consequent is a
-class index, and rule bases are partitioned one-per-class — which doesn't
-fit a single shared-consequent Mamdani-regression design. `fuzzyschema`
-fills the layer above `ex_fuzzy`'s primitives: schema-driven generation, a
-chromosome codec that supports rule-only, MF-only, or joint optimization,
-and a GA harness built directly on pymoo, application-agnostic throughout.
+`ex_fuzzy` supplies the low-level fuzzy-set and rule-firing primitives —
+fuzzy sets, rule bases, antecedent membership computation. Building an FLS
+with it means wiring up variables, membership-function parameters, a
+chromosome encoding, and an optimizer by hand, fresh, per project. Its
+built-in optimizer (`evolutionary_fit.py`) is also built around a specific
+shape of problem: one rule base per class, every consequent a class index —
+a natural fit for classification, but not for a single shared-consequent
+Mamdani-regression rule base.
+
+`fuzzyschema` fills the layer above `ex_fuzzy`'s primitives: declare a
+variable schema once, and get generated parameter classes, a chromosome
+codec (rule-only, MF-only, or joint), and a GA harness built directly on
+pymoo — all application-agnostic, all derived from the schema rather than
+hand-written per project.
 
 ## Installation
 
@@ -303,18 +309,24 @@ when there's no seed chromosome to test with (both `rules_fn` and
 `smoke_test=False` if the extra evaluation's cost is a real problem for a
 given `fitness_fn`.
 
-## Known ex_fuzzy issues worked around
+## Relationship to ex_fuzzy
 
-- **KM type-reduction crash**: `ex_fuzzy`'s `centroid.py` calls
-  `np.argwhere` on an array that can be empty (the all-secondary-firing-zero
-  case), raising an `IndexError`. `engine.py`'s `_km_endpoint` reimplements
-  Karnik-Mendel type reduction using `np.searchsorted` instead, avoiding the
-  crash entirely. A fix upstream is planned.
-- **Unordered `consequent_centroids`**: not guaranteed sorted; `engine.py`
-  normalizes with `np.minimum`/`np.maximum` before use.
-- **`IVFS` constructor argument order** is LMF first, UMF second — the
-  reverse of what its docstring states, verified empirically. Every
-  `IVFS(...)` call site in this library accounts for this explicitly.
+`fuzzyschema` uses `ex_fuzzy`'s fuzzy-set classes (`FS`, `IVFS`) and its
+antecedent-membership / rule-firing computation directly — that math is
+not reimplemented here.
+
+Built on top of that foundation:
+
+- **A vectorized, per-sample inference engine.** `engine.py` defuzzifies
+  IT2 output for an entire input array in one call, using a Karnik–Mendel
+  implementation (`_km_endpoint`) with tolerance-based convergence and an
+  array-search switch point, returning one score per sample (`NaN` where no
+  rule fired) rather than a single value aggregated across a batch.
+- **Everything under [Core concepts](#core-concepts) below** — the schema,
+  generated parameter classes, chromosome codec, rule authoring, and GA
+  harness — none of which has a counterpart in `ex_fuzzy`: it supplies the
+  primitives an FLS is built from, not the generation or optimization layer
+  around them.
 
 ## Testing
 
