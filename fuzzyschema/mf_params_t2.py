@@ -24,11 +24,11 @@ from ex_fuzzy.fuzzy_sets import IVFS, fuzzyVariable
 from fuzzyschema.variable_config import Schema, Trap, check_trap
 
 
-# ── Minimum UMF width (GA-mutation repair only, see _make_from_vector_it2) ────
+# ── Minimum trapezoid width (GA-mutation repair only, see _make_from_vector_it2) ──
 
-# Fraction of a field's own domain width used as the minimum UMF trapezoid
-# width floor. Domain-relative, not an absolute constant: variable domains
-# vary wildly in scale across a schema (e.g. lidar_density's (0.0, 12.0) vs
+# Fraction of a field's own domain width used as the minimum trapezoid width
+# floor. Domain-relative, not an absolute constant: variable domains vary
+# wildly in scale across a schema (e.g. lidar_density's (0.0, 12.0) vs
 # lidar_conf's (0.0, 1.0)) -- a fixed absolute epsilon would be negligible
 # for the former and oversized for the latter. 0.1% is small enough to be a
 # no-op on any trapezoid with a normal, non-degenerate spread (real UMF
@@ -36,6 +36,34 @@ from fuzzyschema.variable_config import Schema, Trap, check_trap
 # domain), but large enough to pull a GA-mutated near-zero-width UMF (all 4
 # raw genes landing within noise of each other) away from true degeneracy.
 _MIN_WIDTH_FRACTION = 1e-3
+
+# Absolute width floor, applied as max(_MIN_WIDTH_FRACTION * domain, this).
+#
+# The domain-relative floor above is not sufficient on its own, because the
+# thing it has to defend against is itself absolute: ex_fuzzy's RuleBaseT2
+# samples every consequent term's MF on np.arange(domain[0], domain[1], 0.05)
+# (rules.py:836) -- a hardcoded 0.05 step regardless of how wide the domain
+# is. A trapezoid narrower than that step can fall entirely between two grid
+# points and sample to all-zero, which is exactly the degeneracy that used to
+# hang ex_fuzzy's KM (see fuzzyschema.engine._patch_ex_fuzzy_centroids). On a
+# (0.0, 1.0) output domain the relative floor is only 1e-3 -- 50x too small to
+# help.
+#
+# The usable window is narrow and both ends are load-bearing:
+#   > 0.05  so the trapezoid is guaranteed to land on at least one grid point
+#           (an open interval wider than the step always contains one).
+#   < 0.08  because the thinnest LMFs in a realistic output variable are
+#           ~0.08 wide; a floor at or above that would silently *widen* real,
+#           deliberately-chosen MF params on a from_vector round-trip, which
+#           would perturb a GA's seed chromosome rather than just repairing
+#           degenerate mutants.
+_MIN_WIDTH_ABS = 0.06
+
+
+def _min_width(dom_min: float, dom_max: float) -> float:
+    """The width floor for a field on this domain: the larger of the
+    domain-relative and absolute floors. See both constants above."""
+    return max(_MIN_WIDTH_FRACTION * (dom_max - dom_min), _MIN_WIDTH_ABS)
 
 
 def _widen_if_degenerate(a: float, b: float, c: float, d: float,
@@ -52,6 +80,39 @@ def _widen_if_degenerate(a: float, b: float, c: float, d: float,
     if d - a < epsilon:
         d = min(a + epsilon, dom_max)
     return a, b, c, d
+
+
+def _widen_lmf_if_degenerate(a_l: float, b_l: float, c_l: float, d_l: float,
+                             a_u: float, d_u: float, epsilon: float):
+    """
+    Same width floor as _widen_if_degenerate, but for an LMF, which cannot be
+    widened freely: it must stay inside the UMF that contains it, or
+    _check_containment rejects the whole instance.
+
+    The clamp chain in _from_vector guarantees a *valid* LMF but not a
+    *resolvable* one -- min/max against the UMF's own breakpoints can pull all
+    four LMF points together, producing a hairline (or zero-width) trapezoid
+    that ex_fuzzy's 0.05 consequent grid cannot see at all.
+
+    Widen to min(epsilon, UMF span) -- never wider than the containing UMF has
+    room for. Grow the right edge first; only if a_l sits too close to d_u for
+    that to be enough do we pull the left edge back down. Only a_l and d_l
+    move, so both invariants hold for free:
+      ordering    -- new_d_l >= old d_l >= c_l, and new_a_l <= old a_l <= b_l
+      containment -- new_a_l clamped at a_u, new_d_l clamped at d_u; b/c untouched
+
+    In practice the UMF is widened to >= epsilon *before* this runs, so the
+    min() is not binding and the LMF reaches the full floor. It can only bind
+    when the UMF's own widening was itself clipped at the domain max.
+    """
+    if d_l - a_l >= epsilon:
+        return a_l, b_l, c_l, d_l
+
+    target = min(epsilon, d_u - a_u)
+    d_l = min(a_l + target, d_u)
+    if d_l - a_l < target:
+        a_l = max(d_l - target, a_u)
+    return a_l, b_l, c_l, d_l
 
 
 # ── Containment validation ───────────────────────────────────────────────────
@@ -100,12 +161,19 @@ def _make_from_vector_it2(pairs: dict, field_domain: dict):
 
     `pairs`/`field_domain` are baked in via closure so the returned function
     can have the plain (cls, v) signature every from_vector needs, while
-    still knowing which fields pair up and each field's domain (for the
-    minimum-width epsilon, itself domain-relative -- see
-    _MIN_WIDTH_FRACTION) for *this* schema. field_domain is keyed by the
-    bare term field name (schema.field_domains()'s own convention), so a
-    field's own '_umf'/'_lmf' suffix is stripped before lookup, same
-    pattern chromosome.py's mf_chromosome_bounds uses.
+    still knowing which fields pair up and each field's domain (needed for
+    the minimum-width epsilon -- see _min_width) for *this* schema.
+    field_domain is keyed by the bare term field name
+    (schema.field_domains()'s own convention), so a field's own
+    '_umf'/'_lmf' suffix is stripped before lookup, same pattern
+    chromosome.py's mf_chromosome_bounds uses.
+
+    Both halves of each pair get a width floor: the UMF via
+    _widen_if_degenerate (first, so the LMF has room to grow inside it), the
+    LMF via _widen_lmf_if_degenerate (which additionally respects
+    containment). Without the LMF floor, the clamp chain below can collapse
+    an LMF to a hairline that ex_fuzzy's 0.05 consequent grid samples as
+    all-zero.
     """
 
     def _from_vector(cls, v: np.ndarray):
@@ -134,7 +202,7 @@ def _make_from_vector_it2(pairs: dict, field_domain: dict):
             # ordering check, which every field goes through in
             # __post_init__) never has to cope with a degenerate UMF.
             dom_min, dom_max = field_domain[umf_name[:-4]]
-            epsilon = _MIN_WIDTH_FRACTION * (dom_max - dom_min)
+            epsilon = _min_width(dom_min, dom_max)
             a_u, b_u, c_u, d_u = _widen_if_degenerate(a_u, b_u, c_u, d_u, epsilon, dom_max)
 
             # LMF is built as a chain anchored to the now-fixed UMF: each
@@ -158,6 +226,13 @@ def _make_from_vector_it2(pairs: dict, field_domain: dict):
             c_l = min(max(h3, b_l), c_u)
             d_l = min(max(h4, c_l), d_u)
 
+            # The chain above guarantees a valid, contained LMF -- but not one
+            # wide enough for ex_fuzzy's 0.05 consequent grid to resolve. Widen
+            # it inside the UMF (see _widen_lmf_if_degenerate).
+            a_l, b_l, c_l, d_l = _widen_lmf_if_degenerate(
+                a_l, b_l, c_l, d_l, a_u, d_u, epsilon,
+            )
+
             trap_dict[umf_name] = (float(a_u), float(b_u), float(c_u), float(d_u))
             trap_dict[lmf_name] = (float(a_l), float(b_l), float(c_l), float(d_l))
             processed.add(umf_name)
@@ -174,7 +249,7 @@ def _make_from_vector_it2(pairs: dict, field_domain: dict):
                 a, b, c, d = sorted(v[i * 4:(i + 1) * 4])
                 base = fn[:-4] if fn.endswith(('_umf', '_lmf')) else fn
                 dom_min, dom_max = field_domain[base]
-                epsilon = _MIN_WIDTH_FRACTION * (dom_max - dom_min)
+                epsilon = _min_width(dom_min, dom_max)
                 a, b, c, d = _widen_if_degenerate(a, b, c, d, epsilon, dom_max)
                 trap_dict[fn] = (float(a), float(b), float(c), float(d))
 
