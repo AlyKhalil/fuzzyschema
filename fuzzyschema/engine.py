@@ -11,11 +11,15 @@ ex_fuzzy's RuleBaseT2.inference() has an IndexError in consequent_centroid_r
 when no element satisfies the argwhere condition on certain inputs. T2FLSEngine
 bypasses this by calling compute_rule_antecedent_memberships() (which works
 correctly) and then applying _km_endpoint() for type reduction directly.
+
+The same broken KM is *also* reached at construction time, which inference-level
+bypassing cannot reach -- see _patch_ex_fuzzy_centroids() below.
 """
 
 from abc import ABC, abstractmethod
 
 import numpy as np
+import ex_fuzzy.centroid
 from ex_fuzzy.rules import RuleBaseT1, RuleBaseT2
 
 
@@ -76,6 +80,69 @@ def _km_endpoint(
         y = y_new
 
     return y
+
+
+# ── ex_fuzzy consequent-centroid patch ───────────────────────────────────────
+
+def _centroid_t2_l(z: np.ndarray, memberships: np.ndarray) -> float:
+    """Left consequent-centroid endpoint. memberships is (N, 2) = (LMF, UMF),
+    matching IVFS's (LMF, UMF) construction order."""
+    m = np.asarray(memberships, dtype=float)
+    return _km_endpoint(m[:, 1], m[:, 0], np.asarray(z, dtype=float))
+
+
+def _centroid_t2_r(z: np.ndarray, memberships: np.ndarray) -> float:
+    """Right consequent-centroid endpoint. Primary/secondary are swapped
+    relative to _centroid_t2_l, per _km_endpoint's documented convention."""
+    m = np.asarray(memberships, dtype=float)
+    return _km_endpoint(m[:, 0], m[:, 1], np.asarray(z, dtype=float))
+
+
+def _patch_ex_fuzzy_centroids() -> None:
+    """Rebind ex_fuzzy.centroid's IT2 centroid endpoints onto _km_endpoint.
+
+    RuleBaseT2.__init__ computes self.consequent_centroids as a *side effect of
+    construction* (ex_fuzzy/rules.py:841), so T2FLSEngine cannot bypass it the
+    way run_inference() bypasses RuleBaseT2.inference() -- by the time the
+    engine holds a rule base, the damage is done. The patch therefore has to be
+    in place before any RuleBaseT2 is constructed, which importing this module
+    guarantees.
+
+    ex_fuzzy's own compute_centroid_t2_l/_r are broken two ways:
+
+      1. They converge on exact float equality (`while yhat != yhat_2`) with no
+         guard against sum(w) == 0. A consequent term whose LMF samples to
+         all-zero on the 0.05 grid makes center_of_masses return 0/0 = NaN.
+         The loop then does NOT freeze on NaN -- it oscillates in a 2-cycle,
+         because the empty-argwhere IndexError fallback (k = 0) rescues yhat to
+         a finite value every other iteration and routes straight back into the
+         degenerate branch. A bare iteration cap is thus not a fix: it returns
+         whichever half of the cycle the cap lands on.
+      2. The switch point (`argwhere(...)[-1]`) selects the *last* index
+         satisfying the condition. Since the domain grid is ascending, that is
+         essentially always N-1, collapsing "KM" into a plain LMF-weighted
+         centroid -- which yields inverted intervals (left endpoint > right)
+         even on perfectly healthy input.
+
+    _km_endpoint has neither problem: searchsorted for the switch point, a
+    tolerance-bounded loop, and an explicit zero-denominator fallback.
+
+    Patching the two leaf functions rather than compute_centroid_iv is
+    deliberate: compute_centroid_iv looks them up as module globals at call
+    time, so rebinding the leaves fixes every caller (both RuleBase centroid
+    sites, rules.py:374 and :841) while keeping compute_centroid_t2_l/_r
+    directly callable -- and therefore directly testable.
+
+    Idempotent: safe to call more than once.
+    """
+    if getattr(ex_fuzzy.centroid, '_fuzzyschema_patched', False):
+        return
+    ex_fuzzy.centroid.compute_centroid_t2_l = _centroid_t2_l
+    ex_fuzzy.centroid.compute_centroid_t2_r = _centroid_t2_r
+    ex_fuzzy.centroid._fuzzyschema_patched = True
+
+
+_patch_ex_fuzzy_centroids()
 
 
 # ── Abstract interface ───────────────────────────────────────────────────────

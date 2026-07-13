@@ -1,7 +1,13 @@
+import time
+
+import ex_fuzzy.centroid
 import numpy as np
 import pytest
 
-from fuzzyschema.engine import T1FLSEngine, T2FLSEngine, validate_input, _km_endpoint
+from fuzzyschema.engine import (
+    T1FLSEngine, T2FLSEngine, validate_input, _km_endpoint,
+    _centroid_t2_l, _centroid_t2_r, _patch_ex_fuzzy_centroids,
+)
 from fuzzyschema.mf_params import build_mf_params_class, get_antecedents, get_output_var
 from fuzzyschema.mf_params_t2 import build_it2_mf_params_class, make_it2_from_t1, get_antecedents_t2, get_output_var_t2
 from fuzzyschema.rules import RuleFactory
@@ -98,3 +104,78 @@ class TestKMEndpointGeneric:
         f_secondary = np.zeros(3)
         c = np.array([0.0, 1.0, 2.0])
         assert np.isnan(_km_endpoint(f_primary, f_secondary, c))
+
+
+class TestExFuzzyCentroidPatch:
+    """Importing fuzzyschema.engine rebinds ex_fuzzy.centroid's IT2 centroid
+    endpoints onto _km_endpoint -- see _patch_ex_fuzzy_centroids.
+
+    Before the patch, an all-zero LMF made ex_fuzzy's compute_centroid_t2_r
+    loop forever: sum(w) == 0 gives 0/0 = NaN, and `while yhat != yhat_2`
+    never terminates because the empty-argwhere IndexError fallback (k = 0)
+    bounces yhat between NaN and a finite wrong value in a 2-cycle. These
+    tests would HANG on unpatched ex_fuzzy, so they are also the regression
+    guard for the patch being applied at all.
+    """
+
+    def test_patch_is_installed(self):
+        assert ex_fuzzy.centroid.compute_centroid_t2_l is _centroid_t2_l
+        assert ex_fuzzy.centroid.compute_centroid_t2_r is _centroid_t2_r
+
+    def test_patch_is_idempotent(self):
+        _patch_ex_fuzzy_centroids()
+        _patch_ex_fuzzy_centroids()
+        assert ex_fuzzy.centroid.compute_centroid_t2_r is _centroid_t2_r
+
+    def test_all_zero_memberships_terminates_with_nan(self):
+        # The exact input that used to hang. An entirely empty fuzzy set has
+        # no defined centroid, so NaN is the honest answer -- the contract
+        # being asserted is that it *returns* one, promptly.
+        z = np.array([0.1, 0.4, 0.6])
+        memberships = np.zeros((3, 2))
+
+        start = time.perf_counter()
+        r = ex_fuzzy.centroid.compute_centroid_t2_r(z, memberships)
+        l = ex_fuzzy.centroid.compute_centroid_t2_l(z, memberships)
+        elapsed = time.perf_counter() - start
+
+        assert np.isnan(r)
+        assert np.isnan(l)
+        assert elapsed < 1.0, f"took {elapsed:.2f}s -- should be near-instant"
+
+    def test_zero_lmf_falls_back_to_umf_weighted_centroid(self):
+        # The realistic degenerate case: LMF samples to all-zero on the grid
+        # (too thin to land on a grid point) but the UMF is healthy. _km_endpoint
+        # falls back to the secondary-weighted centroid rather than NaN.
+        z = np.array([0.0, 1.0, 2.0])
+        memberships = np.column_stack([
+            np.zeros(3),              # LMF: all-zero
+            np.array([1.0, 1.0, 1.0]),  # UMF: uniform -> centroid = mean(z) = 1.0
+        ])
+
+        r = ex_fuzzy.centroid.compute_centroid_t2_r(z, memberships)
+
+        assert r == pytest.approx(1.0)
+        assert np.isfinite(r)
+
+    def test_interval_is_never_inverted(self):
+        # ex_fuzzy's argwhere(...)[-1] switch point returned y_l > y_r on
+        # perfectly healthy input (a real inverted interval). searchsorted does not.
+        z = np.arange(0.0, 1.0, 0.05)
+        lmf = np.clip(1.0 - np.abs(z - 0.2) / 0.15, 0.0, 1.0)
+        umf = np.clip(1.0 - np.abs(z - 0.2) / 0.30, 0.0, 1.0)
+        memberships = np.column_stack([lmf, umf])
+
+        l = ex_fuzzy.centroid.compute_centroid_t2_l(z, memberships)
+        r = ex_fuzzy.centroid.compute_centroid_t2_r(z, memberships)
+
+        assert np.isfinite(l) and np.isfinite(r)
+        assert l <= r, f"inverted interval: y_l={l} > y_r={r}"
+
+    def test_compute_centroid_iv_uses_the_patched_endpoints(self):
+        # compute_centroid_iv resolves the two endpoint fns as module globals
+        # at call time, so patching the leaves must reach it -- this is what
+        # makes RuleBaseT2.__init__ (the actual hang site) safe.
+        z = np.array([0.1, 0.4, 0.6])
+        iv = ex_fuzzy.centroid.compute_centroid_iv(z, np.zeros((3, 2)))
+        assert np.isnan(iv).all()
