@@ -53,7 +53,10 @@ Initialisation: first individual seeded from rules_fn / mf_seed_fn (if
   given) via codec.expert_chromosome() / mf_params_cls_instance.to_vector();
   remainder drawn uniformly at random within each block's own bounds.
 Crossover: single-point crossover.
-Mutation: polynomial mutation per gene.
+Mutation: polynomial mutation, applied to every individual, at a per-gene rate
+  of 1/block_len calibrated separately for each block -- 1/rule_len over the
+  rule block and 1/mf_len over the MF block, so a longer chromosome does not
+  dilute rule-gene mutation pressure. See _make_mutation.
 Selection: tournament selection (pymoo GA default).
 """
 
@@ -337,6 +340,101 @@ def _save_artefacts(run_dir: str, codec: RuleChromosomeCodec, schema: Schema,
         json.dump(history, f, indent=2)
 
 
+# ── Mutation operator ─────────────────────────────────────────────────────────
+
+# Per-individual mutation gate (pymoo's Mutation.prob). 1.0 = every individual
+# is mutated, so the per-gene rate (prob_var, set per block below) is the only
+# thing controlling mutation pressure. See _make_mutation for why this is not
+# left at pymoo's 0.9 default and, in particular, why it must not be set to
+# 1/n_var.
+_MUTATION_PROB = 1.0
+
+
+def _make_mutation(rule_len: int, mf_len: int, eta: float, prob: float = _MUTATION_PROB):
+    """
+    Build the GA's mutation operator.
+
+    pymoo's two mutation probabilities, which are easy to conflate:
+
+      * `prob`     -- the per-INDIVIDUAL gate. Mutation.do() draws
+                      `mut = random_state.random(n_individuals) <= prob` and
+                      only writes the mutated genes back for the individuals
+                      that pass it.
+      * `prob_var` -- the per-GENE rate, applied within an individual that
+                      passed the gate. Mutation.get_prob_var() already defaults
+                      it to min(0.5, 1/problem.n_var) when it isn't given.
+
+    This call site used to construct PolynomialMutation(prob=1.0/n_var), which
+    reads as "mutate each gene with probability 1/n_var" but actually sets the
+    per-individual gate to 1/n_var while leaving the per-gene rate at its
+    1/n_var default. The two then multiply: the effective per-gene rate was
+    ~(1/n_var)**2, i.e. ~100x below nominal for an 81-gene rule-only chromosome
+    (measured 0.000121 against a nominal 1/81 = 0.0123) and ~500x below nominal
+    for a 217-gene combined one. Mutation was effectively switched off in both
+    modes. Hence `prob` defaults to 1.0 here (mutate every individual) and the
+    per-gene rate is passed separately and explicitly.
+
+    Rule-only mode (mf_len == 0) uses a stock PolynomialMutation with an
+    explicit per-gene prob_var of 1/rule_len.
+
+    Combined rule+MF mode (mf_len > 0) needs a per-BLOCK per-gene rate, which
+    pymoo has no native support for: mut_pm's own `prob` argument (per-gene,
+    unlike Mutation's) is one scalar per individual, broadcast identically
+    across every gene column (see pymoo.operators.crossover.binx.mut_binomial).
+    A single shared per-gene rate of 1/n_var would give the 81 rule genes
+    1/217 instead of 1/81 -- a 2.7x cut in rule-gene mutation pressure that is
+    a side effect of the chromosome getting longer, not a deliberate choice.
+    So the two blocks are mutated in separate mut_pm calls, each with its own
+    per-gene rate (1/rule_len and 1/mf_len), giving each block the rate it
+    would have if it were the only thing being optimised, rather than making
+    the two compete for one shared budget.
+
+    at_least_once=False matches PolynomialMutation's own default and is the
+    correct choice for a per-gene-rate model: it leaves P(>=1 rule-gene
+    mutation) at 1-(1-1/rule_len)**rule_len (~0.63 for rule_len=81) rather
+    than forcing every individual to take at least one mutation in every block.
+    """
+    from pymoo.core.mutation import Mutation
+    from pymoo.operators.mutation.pm import PolynomialMutation, mut_pm
+
+    if mf_len == 0:
+        return PolynomialMutation(prob=prob, prob_var=1.0 / rule_len, eta=eta)
+
+    class _BlockChunkedPolynomialMutation(Mutation):
+        def __init__(self):
+            super().__init__(prob=prob)
+            self.rule_len = rule_len
+            self.mf_len = mf_len
+            self.eta = eta
+            self.rule_prob = 1.0 / rule_len
+            self.mf_prob = 1.0 / mf_len
+
+        def _do(self, problem, X, params=None, *args, random_state=None, **kwargs):
+            X = X.astype(float)
+            n = X.shape[0]
+            rl = self.rule_len
+            eta_arr = np.full(n, self.eta)
+            Xp = X.copy()
+
+            # The rule block occupies genes [0, rule_len) and the MF block
+            # [rule_len, n_var) -- the layout build_combined_chromosome lays
+            # down and run_ga concatenates the bounds in, so these slices of
+            # problem.xl/xu line up with these slices of X.
+            Xp[:, :rl] = mut_pm(
+                X[:, :rl], problem.xl[:rl], problem.xu[:rl], eta_arr,
+                np.full(n, self.rule_prob), at_least_once=False,
+                random_state=random_state,
+            )
+            Xp[:, rl:] = mut_pm(
+                X[:, rl:], problem.xl[rl:], problem.xu[rl:], eta_arr,
+                np.full(n, self.mf_prob), at_least_once=False,
+                random_state=random_state,
+            )
+            return Xp
+
+    return _BlockChunkedPolynomialMutation()
+
+
 # ── Public API ─────────────────────────────────────────────────────────────────
 
 def run_ga(
@@ -439,7 +537,6 @@ def run_ga(
     """
     from pymoo.algorithms.soo.nonconvex.ga import GA
     from pymoo.operators.crossover.pntx import SinglePointCrossover
-    from pymoo.operators.mutation.pm import PolynomialMutation
     from pymoo.optimize import minimize
     from pymoo.parallelization.joblib import JoblibParallelization
 
@@ -477,6 +574,9 @@ def run_ga(
         'n_gen': n_gen,
         'crossover_prob': crossover_prob,
         'mutation_eta': mutation_eta,
+        'mutation_prob': _MUTATION_PROB,
+        'rule_mutation_prob_var': 1.0 / codec.chrom_len,
+        'mf_mutation_prob_var': (1.0 / mf_len) if mf_len else None,
         'seed': seed,
         'chromosome_len': n_var,
         'rule_chromosome_len': codec.chrom_len,
@@ -538,7 +638,7 @@ def run_ga(
         pop_size=pop_size,
         sampling=sampling,
         crossover=SinglePointCrossover(prob=crossover_prob),
-        mutation=PolynomialMutation(prob=1.0 / n_var, eta=mutation_eta),
+        mutation=_make_mutation(codec.chrom_len, mf_len, mutation_eta),
         eliminate_duplicates=True,
     )
 

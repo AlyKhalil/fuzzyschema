@@ -5,8 +5,10 @@ import os
 import numpy as np
 import pytest
 
+from pymoo.core.population import Population
+
 from fuzzyschema.chromosome import RuleChromosomeCodec, mf_chromosome_bounds
-from fuzzyschema.ga import run_ga, rules_to_readable
+from fuzzyschema.ga import _make_mutation, run_ga, rules_to_readable
 from fuzzyschema.mf_params import build_mf_params_class
 from fuzzyschema.mf_params_t2 import build_it2_mf_params_class, make_it2_from_t1
 from fuzzyschema.rules import RuleFactory
@@ -492,3 +494,220 @@ class TestRulesToReadable:
         assert readable[0]['x1'] == 'HIGH'  # 'HIGH' < 'LOW' alphabetically
         assert readable[1]['x1'] == 'LOW'
         assert len(readable) == 2
+
+
+# ── Mutation operator ─────────────────────────────────────────────────────────
+
+# The dissertation's real chromosome shape (4 antecedents x 3 terms = 81 rule
+# genes; 34 MF fields x 4 breakpoints = 136 MF genes), used here so the rates
+# under test are the ones an actual --mf-optimize run sees.
+RULE_LEN, MF_LEN = 81, 136
+
+
+def _mutation_problem(rule_len, mf_len):
+    """Minimal pymoo Problem carrying the same bounds layout run_ga builds:
+    rule genes first (bounded [0, n_consequents]), MF genes second."""
+    from pymoo.core.problem import Problem
+
+    xl = np.concatenate([np.zeros(rule_len), np.zeros(mf_len)])
+    xu = np.concatenate([np.full(rule_len, 3.0), np.full(mf_len, 1.0)])
+
+    class _P(Problem):
+        def __init__(self):
+            super().__init__(n_var=rule_len + mf_len, n_obj=1, xl=xl, xu=xu)
+
+    return _P()
+
+
+def _measure(op, problem, X, trials=400, seed=0):
+    """Measure realised mutation rates through Mutation.do() -- the public path
+    the GA itself calls -- NOT through _do().
+
+    This distinction is the whole point. _do() computes the per-gene
+    perturbation but Mutation.do() *then* applies the per-individual gate
+    (self.prob) and only writes back the individuals that pass it. Measuring
+    _do() in isolation reports the nominal per-gene rate and is blind to the
+    gate entirely -- which is exactly how a prob/prob_var mix-up that cut the
+    effective rate ~100x went unnoticed.
+
+    Returns (P(individual changed), per-gene rate in rule block, per-gene rate
+    in MF block).
+    """
+    rng = np.random.default_rng(seed)
+    n_ind = changed = 0
+    gene_hits = np.zeros(problem.n_var)
+
+    for _ in range(trials):
+        Xp = op.do(problem, Population.new(X=X.copy()), random_state=rng).get('X')
+        diff = ~np.isclose(Xp, X)
+        changed += diff.any(axis=1).sum()
+        gene_hits += diff.sum(axis=0)
+        n_ind += len(X)
+
+    rule_rate = gene_hits[:RULE_LEN].sum() / (n_ind * RULE_LEN)
+    mf_rate = (gene_hits[RULE_LEN:].sum() / (n_ind * MF_LEN)
+               if problem.n_var > RULE_LEN else 0.0)
+    return changed / n_ind, rule_rate, mf_rate
+
+
+def _mid_domain_X(problem, n=50, seed=1):
+    """Non-degenerate starting population: every gene strictly interior to its
+    bounds, so a mutation always has room to move it and cannot be masked by
+    mut_pm's xl == xu guard or clipped back onto its own starting value."""
+    xl, xu = problem.xl, problem.xu
+    u = np.random.default_rng(seed).uniform(0.3, 0.7, size=(n, problem.n_var))
+    return xl + u * (xu - xl)
+
+
+class TestMakeMutation:
+    def test_rule_only_returns_polynomial_mutation_with_per_gene_prob_var(self):
+        """Rule-only mode: the per-INDIVIDUAL gate is 1.0 (mutate everyone) and
+        the per-GENE rate is 1/rule_len -- passed as prob_var, not prob."""
+        from pymoo.core.variable import get
+        from pymoo.operators.mutation.pm import PolynomialMutation
+
+        op = _make_mutation(RULE_LEN, 0, eta=20.0)
+
+        assert isinstance(op, PolynomialMutation)
+        assert get(op.prob) == 1.0
+        assert get(op.prob_var) == pytest.approx(1.0 / RULE_LEN)
+
+    def test_rule_only_effective_per_gene_rate_is_one_over_rule_len(self):
+        """Regression guard for the prob/prob_var mix-up.
+
+        The old call site -- PolynomialMutation(prob=1.0/n_var) -- set the
+        per-individual gate to 1/81 while the per-gene rate defaulted to 1/81
+        as well, so the two multiplied and the realised per-gene rate was
+        ~(1/81)**2 ~= 0.00012 rather than 0.0123. This test measures the
+        realised rate through .do() and fails loudly against that code.
+        """
+        problem = _mutation_problem(RULE_LEN, 0)
+        X = _mid_domain_X(problem)
+        op = _make_mutation(RULE_LEN, 0, eta=20.0)
+
+        ind_rate, rule_rate, _ = _measure(op, problem, X)
+
+        assert rule_rate == pytest.approx(1.0 / RULE_LEN, rel=0.15)
+        # Every individual passes the gate, so P(>=1 gene changed) is just
+        # 1-(1-1/81)^81 ~= 0.63 -- not the ~0.007 the old operator produced.
+        assert ind_rate == pytest.approx(1 - (1 - 1 / RULE_LEN) ** RULE_LEN, rel=0.1)
+
+    def test_combined_mode_returns_block_chunked_variant(self):
+        from pymoo.core.mutation import Mutation
+        from pymoo.operators.mutation.pm import PolynomialMutation
+
+        op = _make_mutation(RULE_LEN, MF_LEN, eta=20.0)
+
+        assert isinstance(op, Mutation)
+        assert not isinstance(op, PolynomialMutation)
+        assert op.rule_prob == pytest.approx(1.0 / RULE_LEN)
+        assert op.mf_prob == pytest.approx(1.0 / MF_LEN)
+
+    def test_combined_mode_hits_target_per_block_rates(self):
+        """Each block mutates at its own 1/block_len rate. A single shared
+        1/n_var rate would give BOTH blocks 1/217 = 0.0046, starving the rule
+        block; this asserts the rule block keeps the 1/81 it would get if it
+        were the only thing being optimised."""
+        problem = _mutation_problem(RULE_LEN, MF_LEN)
+        X = _mid_domain_X(problem)
+        op = _make_mutation(RULE_LEN, MF_LEN, eta=20.0)
+
+        _, rule_rate, mf_rate = _measure(op, problem, X)
+
+        assert rule_rate == pytest.approx(1.0 / RULE_LEN, rel=0.15)
+        assert mf_rate == pytest.approx(1.0 / MF_LEN, rel=0.15)
+        # And specifically NOT the diluted shared rate.
+        shared = 1.0 / (RULE_LEN + MF_LEN)
+        assert rule_rate > 1.5 * shared
+
+    def test_combined_mode_respects_per_block_bounds(self):
+        """Rule genes are bounded [0, 3] and MF genes [0, 1] here; the operator
+        slices problem.xl/xu per block, so a slice/ordering mismatch would push
+        MF genes past 1.0 without erroring."""
+        problem = _mutation_problem(RULE_LEN, MF_LEN)
+        X = _mid_domain_X(problem)
+        op = _make_mutation(RULE_LEN, MF_LEN, eta=20.0)
+
+        Xp = op.do(problem, Population.new(X=X.copy()),
+                   random_state=np.random.default_rng(3)).get('X')
+
+        assert np.all(Xp >= problem.xl - 1e-12)
+        assert np.all(Xp <= problem.xu + 1e-12)
+        assert Xp[:, :RULE_LEN].max() <= 3.0 + 1e-12
+        assert Xp[:, RULE_LEN:].max() <= 1.0 + 1e-12
+
+    def test_combined_mode_is_deterministic_given_the_same_random_state(self):
+        """The block-chunked operator draws from the passed-in random_state
+        twice (once per mut_pm call). Sequential consumption from one Generator
+        is still deterministic, so a given seed must reproduce exactly."""
+        problem = _mutation_problem(RULE_LEN, MF_LEN)
+        X = _mid_domain_X(problem)
+
+        def _run(seed):
+            op = _make_mutation(RULE_LEN, MF_LEN, eta=20.0)
+            return op.do(problem, Population.new(X=X.copy()),
+                         random_state=np.random.default_rng(seed)).get('X')
+
+        np.testing.assert_array_equal(_run(42), _run(42))
+        assert not np.array_equal(_run(42), _run(43))
+
+    def test_at_least_once_false_leaves_some_individuals_untouched_per_block(self):
+        """at_least_once=False (PolynomialMutation's default, preserved here) is
+        the correct choice for a per-gene-rate model: an individual takes ~1
+        mutation per block ON AVERAGE, so ~37% of individuals take none in the
+        rule block. at_least_once=True would force every individual to take at
+        least one mutation in EVERY block, inflating the realised rate."""
+        problem = _mutation_problem(RULE_LEN, MF_LEN)
+        X = _mid_domain_X(problem)
+        op = _make_mutation(RULE_LEN, MF_LEN, eta=20.0)
+
+        rng = np.random.default_rng(11)
+        untouched = total = 0
+        for _ in range(100):
+            Xp = op.do(problem, Population.new(X=X.copy()), random_state=rng).get('X')
+            rule_changed = (~np.isclose(Xp[:, :RULE_LEN], X[:, :RULE_LEN])).any(axis=1)
+            untouched += (~rule_changed).sum()
+            total += len(X)
+
+        expected = (1 - 1 / RULE_LEN) ** RULE_LEN  # ~0.366
+        assert untouched / total == pytest.approx(expected, rel=0.1)
+
+
+class TestRunGAReproducibility:
+    """Same-seed reproducibility is the guarantee that survives the mutation
+    fix. Cross-version bit-identity is deliberately given up: the fix changes
+    rule-only GA trajectories (mutation was previously ~100x too weak), so
+    pre-fix baselines must be re-run rather than compared against."""
+
+    def test_rule_only_same_seed_reproduces_exactly(self, toy_schema, tmp_path):
+        codec = RuleChromosomeCodec(toy_schema)
+
+        def _run():
+            return run_ga(
+                schema=toy_schema,
+                fitness_fn=_n_active_rules_fitness(codec),
+                pop_size=8, n_gen=4, seed=42, verbose=False,
+                run_dir_base=str(tmp_path), smoke_test=False,
+            )
+
+        a, b = _run(), _run()
+        np.testing.assert_array_equal(a['best_chromosome'], b['best_chromosome'])
+        assert a['best_score'] == b['best_score']
+
+    def test_mf_optimize_same_seed_reproduces_exactly(self, toy_schema, tmp_path):
+        codec = RuleChromosomeCodec(toy_schema)
+        mf_cls = build_it2_mf_params_class(toy_schema)
+        mf_len = len(mf_chromosome_bounds(mf_cls, toy_schema)[0])
+
+        def _run():
+            return run_ga(
+                schema=toy_schema,
+                fitness_fn=_combined_fitness(codec, codec.chrom_len, mf_len),
+                mf_params_cls=mf_cls,
+                pop_size=8, n_gen=4, seed=42, verbose=False,
+                run_dir_base=str(tmp_path), smoke_test=False,
+            )
+
+        a, b = _run(), _run()
+        np.testing.assert_array_equal(a['best_chromosome'], b['best_chromosome'])
+        assert a['best_score'] == b['best_score']
