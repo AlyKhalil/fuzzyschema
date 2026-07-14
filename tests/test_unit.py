@@ -334,9 +334,10 @@ class TestChaining:
     def test_output_column_name_comes_from_the_schema_not_the_unit_name(
         self, schema_a,
     ):
-        # The confirmed naming rule: the column is schema.output.name
-        # ('a_out'), NOT the unit_name in the units list ('some_other_name').
-        unit_a = make_unit('a', schema_a, dense_rules_fn(2, lambda c: c[0]))
+        # The confirmed naming rule: the column is schema.output.name ('a_out'),
+        # NOT the unit's name ('some_other_name') and not a name derived from it.
+        # The unit and the units-list entry share that name, as they now must.
+        unit_a = make_unit('some_other_name', schema_a, dense_rules_fn(2, lambda c: c[0]))
         hfls = HierarchicalFLS([
             ('some_other_name', unit_a, {'in1': 'in1', 'in2': 'in2'}),
         ])
@@ -428,14 +429,31 @@ class TestColumnMapValidation:
             hfls.run_inference(pd.DataFrame({'in1': [0.1], 'in2': [0.1], 'in3': [0.1]}))
 
     def test_duplicate_unit_names_raise_at_construction(self, schema_a, schema_b):
-        unit_a = make_unit('a', schema_a, dense_rules_fn(2, lambda c: c[0]))
-        unit_b = make_unit('b', schema_b, dense_rules_fn(2, lambda c: c[0]))
+        # Both units are themselves named 'dup', so the names agree with the
+        # list entries and it is the DUPLICATION that must be caught, not the
+        # unit-name mismatch check.
+        unit_a = make_unit('dup', schema_a, dense_rules_fn(2, lambda c: c[0]))
+        unit_b = make_unit('dup', schema_b, dense_rules_fn(2, lambda c: c[0]))
 
         with pytest.raises(ValueError, match="duplicate unit name"):
             HierarchicalFLS([
                 ('dup', unit_a, {'in1': 'in1', 'in2': 'in2'}),
                 ('dup', unit_b, {'prev': 'a_out', 'in3': 'in3'}),
             ])
+
+    def test_unit_name_disagreeing_with_the_list_name_raises(self, schema_a):
+        # The two names must agree. If they didn't, an override keyed by the
+        # unit's own name ('a') while the chain keys it by another ('stage_a')
+        # would simply never be applied -- silently, and invisibly in a GA's
+        # fitness curve.
+        unit_a = make_unit('a', schema_a, dense_rules_fn(2, lambda c: c[0]))
+
+        with pytest.raises(ValueError) as exc:
+            HierarchicalFLS([('stage_a', unit_a, {'in1': 'in1', 'in2': 'in2'})])
+
+        msg = str(exc.value)
+        assert "mismatch" in msg
+        assert "'stage_a'" in msg and "'a'" in msg  # names BOTH values
 
 
 # ── overrides ─────────────────────────────────────────────────────────────────

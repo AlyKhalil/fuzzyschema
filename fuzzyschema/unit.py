@@ -218,10 +218,14 @@ class HierarchicalFLS:
         Args:
             units: [(unit_name, unit, column_map)], in EXECUTION ORDER.
 
-              unit_name  is the key `overrides` uses. It is independent of
-                         FLSUnit.name -- this list's name is authoritative here.
-                         Duplicate names raise: they would make an override
-                         ambiguous.
+              unit_name  is the key `overrides` uses. It MUST equal the unit's
+                         own FLSUnit.name -- a mismatch raises. The two names
+                         are not allowed to drift apart: an override keyed by
+                         the unit's own name while the chain keys it by another
+                         would simply never be applied, and a silently
+                         unapplied override is invisible in a GA's fitness
+                         curve. Duplicate names raise for the same reason --
+                         they would make an override ambiguous.
 
               column_map is {schema_antecedent_name: df_column_name}, and is
                          STRICT: it must name every one of the unit schema's
@@ -234,6 +238,14 @@ class HierarchicalFLS:
         """
         seen: set = set()
         for unit_name, unit, column_map in units:
+            if unit_name != unit.name:
+                raise ValueError(
+                    f"HierarchicalFLS: unit name mismatch -- the units list "
+                    f"names this unit {unit_name!r}, but its FLSUnit.name is "
+                    f"{unit.name!r}. The two must agree: `overrides` is keyed "
+                    f"by this name, so a mismatch would leave an override "
+                    f"keyed by {unit.name!r} silently unapplied."
+                )
             if unit_name in seen:
                 raise ValueError(
                     f"HierarchicalFLS: duplicate unit name {unit_name!r} -- "
