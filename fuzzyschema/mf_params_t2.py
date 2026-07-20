@@ -24,7 +24,12 @@ from ex_fuzzy.fuzzy_sets import IVFS, fuzzyVariable
 from fuzzyschema.variable_config import Schema, Trap, check_trap
 
 
-# ── Minimum trapezoid width (GA-mutation repair only, see _make_from_vector_it2) ──
+# ── Minimum trapezoid width ───────────────────────────────────────────────────
+#
+# Applied by BOTH constructors of an IT2MFParams: _make_from_vector_it2 (raw
+# GA genes) and make_it2_from_t1's expand_contract (T1 -> FOU expansion). Both
+# can produce a trapezoid too narrow for ex_fuzzy's consequent grid to see, by
+# different routes -- see each call site for which route.
 
 # Fraction of a field's own domain width used as the minimum trapezoid width
 # floor. Domain-relative, not an absolute constant: variable domains vary
@@ -380,7 +385,30 @@ def make_it2_from_t1(
         if c >= dom_max and dd >= dom_max:
             lmf_c = lmf_d = dom_max
 
-        return (umf_a, umf_b, umf_c, umf_d), (lmf_a, lmf_b, lmf_c, lmf_d)
+        # Same width floor from_vector applies (see _min_width and
+        # _make_from_vector_it2). The guards above keep the pair valid but not
+        # *resolvable*: eff_d is capped at (c - b) / 2, so a trapezoid with a
+        # narrow core contracts its LMF towards a point (a rectangular core,
+        # b == a and c == dd, collapses it exactly onto one), and a T1
+        # trapezoid already narrower than the floor stays narrow in the UMF,
+        # since expansion only ever adds eff_d to each side. Either lands
+        # under ex_fuzzy's 0.05 consequent grid step and samples to all-zero.
+        # Unreachable while delta is hand-picked; reachable the moment delta
+        # becomes a GA gene.
+        #
+        # UMF first, then LMF, exactly as _make_from_vector_it2 orders them --
+        # the LMF's floor is bounded by the UMF span, so it needs a finalised
+        # UMF. Both helpers only move points outward (UMF's d right; LMF's d
+        # right, then a left), so every guard above survives untouched: `a` is
+        # never lifted off a domain-pinned left edge, and an LMF flat top
+        # pinned at dom_max stays pinned (d_l already sits at d_u == dom_max,
+        # so it cannot move and the LMF widens leftward instead).
+        epsilon = _min_width(dom_min, dom_max)
+        umf = _widen_if_degenerate(umf_a, umf_b, umf_c, umf_d, epsilon, dom_max)
+        lmf = _widen_lmf_if_degenerate(
+            lmf_a, lmf_b, lmf_c, lmf_d, umf[0], umf[3], epsilon,
+        )
+        return umf, lmf
 
     trap_dict = {}
     for f in dataclasses.fields(t1):
