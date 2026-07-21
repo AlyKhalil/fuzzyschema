@@ -24,7 +24,9 @@ from fuzzyschema.variable_config import Schema, Trap, check_trap
 
 def _post_init(self) -> None:
     for f in dataclasses.fields(self):
-        check_trap(f"{type(self).__name__}.{f.name}", getattr(self, f.name))
+        check_trap(f"{type(self).__name__}.{f.name}", getattr(self, f.name)) # getattr(x, 'y', def) equivalent to x.y; 
+        # can be used to access attributes and methods of an object, if attr 'y' does not exist the given default 'def'
+        # is returned; if no 'def' raises AttributeError
 
 
 def _from_vector(cls, v: np.ndarray) -> "MFParams":
@@ -39,7 +41,9 @@ def _from_vector(cls, v: np.ndarray) -> "MFParams":
     n = len(fields)
     if len(v) != n * 4:
         raise ValueError(f"Expected {n * 4} floats, got {len(v)}")
+    
     chunks = [tuple(sorted(v[i * 4:(i + 1) * 4])) for i in range(n)]
+
     return cls(**dict(zip(fields, chunks)))
 
 
@@ -72,6 +76,7 @@ def build_mf_params_class(schema: Schema, class_name: str = "MFParams") -> Type:
                     f"TermSpec '{var.name}.{term.label}' (field={term.field!r}) "
                     f"has no default trapezoid; cannot build {class_name}."
                 )
+            
             fields.append(
                 (term.field, Trap, dataclasses.field(default=term.default))
             )
@@ -80,11 +85,12 @@ def build_mf_params_class(schema: Schema, class_name: str = "MFParams") -> Type:
         class_name,
         fields,
         namespace={
-            "__post_init__": _post_init,
+            "__post_init__": _post_init, # checks default Trapezoid validity
             "from_vector": classmethod(_from_vector),
             "to_vector": _to_vector,
         },
     )
+
     return cls
 
 
@@ -100,7 +106,9 @@ def get_antecedents(schema: Schema, params) -> list:
             FS(term.label, list(getattr(params, term.field)), domain=list(var.domain))
             for term in var.terms
         ]
+
         result.append(fuzzyVariable(var.name, fsets))
+
     return result
 
 
@@ -110,4 +118,5 @@ def get_output_var(schema: Schema, params) -> fuzzyVariable:
         FS(term.label, list(getattr(params, term.field)), domain=list(schema.output.domain))
         for term in schema.output.terms
     ]
+
     return fuzzyVariable(schema.output.name, fsets)

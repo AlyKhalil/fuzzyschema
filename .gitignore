@@ -18,3 +18,5 @@ env/
 
 *.swp
 .DS_Store
+
+docs/
