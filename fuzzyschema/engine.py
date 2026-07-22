@@ -22,6 +22,8 @@ import numpy as np
 import ex_fuzzy.centroid
 from ex_fuzzy.rules import RuleBaseT1, RuleBaseT2
 
+from fuzzyschema.rules import DONT_CARE
+
 
 # ── Input validation ─────────────────────────────────────────────────────────
 
@@ -34,6 +36,32 @@ def validate_input(X: np.ndarray, n_expected: int, var_names: list) -> None:
             f"run_inference: X must have {n_expected} columns "
             f"({', '.join(var_names)}), got {X.shape[1]}"
         )
+
+
+def _reject_dont_care_antecedents(rules: list) -> None:
+    """Raise ValueError if any rule carries a DONT_CARE (-1) antecedent.
+
+    validate_rules() deliberately PERMITS DONT_CARE: it is a legitimate sparse-
+    authoring / GA-seeding convenience, and RuleChromosomeCodec.expert_chromosome()
+    is the one explicit place that resolves it (via specificity). But the engines
+    wrap ex_fuzzy's RuleBaseT1/RuleBaseT2, which have no wildcard-resolution
+    logic -- a DONT_CARE antecedent reaching them silently co-fires every rule it
+    subsumes instead of most-specific-rule-wins. Engine construction therefore
+    requires a dense rule base.
+
+    Reject, don't auto-expand: expansion has exactly one home already
+    (expert_chromosome), and doing it here would let a caller's mistake through
+    silently instead of failing loud.
+    """
+    for i, rule in enumerate(rules):
+        ants = [int(a) for a in rule.antecedents]
+        if DONT_CARE in ants:
+            raise ValueError(
+                f"Rule {i}: antecedents {ants} contain DONT_CARE ({DONT_CARE}); "
+                f"engine construction requires a dense rule base (no wildcard "
+                f"antecedents). Resolve DONT_CARE before building an engine "
+                f"(e.g. via RuleChromosomeCodec.expert_chromosome())."
+            )
 
 
 # ── Karnik-Mendel type reduction ─────────────────────────────────────────────
@@ -165,6 +193,7 @@ class T1FLSEngine(FLSEngine):
     """Type-1 FLS engine. Rule base is built once at construction."""
 
     def __init__(self, antecedents: list, rules: list, output_var) -> None:
+        _reject_dont_care_antecedents(rules)
         self._antecedents = antecedents
         self._n_inputs = len(antecedents)
         self._var_names = [v.name for v in antecedents]
@@ -194,6 +223,7 @@ class T2FLSEngine(FLSEngine):
         max_iter: int = 100,
         tol: float = 1e-6,
     ) -> None:
+        _reject_dont_care_antecedents(rules)
         self._antecedents = antecedents
         self._n_inputs = len(antecedents)
         self._var_names = [v.name for v in antecedents]

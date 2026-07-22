@@ -27,6 +27,7 @@ from ex_fuzzy.rules import RuleSimple
 
 from fuzzyschema.chromosome import RuleChromosomeCodec
 from fuzzyschema.engine import T1FLSEngine, T2FLSEngine
+from fuzzyschema.rules import DONT_CARE
 from fuzzyschema.unit import FLSUnit, HierarchicalFLS
 
 from conftest import dense_rules_fn, make_unit
@@ -86,6 +87,22 @@ class TestFLSUnitConstruction:
 
         with pytest.raises(ValueError, match="antecedent length"):
             unit.build_engine(rules=[RuleSimple([0], consequent=0)])
+
+    @pytest.mark.parametrize('engine_type', ENGINE_TYPES)
+    def test_build_engine_rejects_dont_care_rule_base(self, gapped_schema, engine_type):
+        # validate_rules() deliberately PERMITS DONT_CARE (a legitimate sparse-
+        # authoring / GA-seeding convenience), so a wildcard antecedent gets past
+        # it. Engine construction is the boundary that must reject it -- and this
+        # is the BASE FLSUnit, no subclass, no build_engine override. A DONT_CARE
+        # reaching ex_fuzzy's RuleBaseT1/T2 (neither resolves wildcards) would
+        # otherwise silently co-fire multiple rules instead of most-specific-wins.
+        def sparse_rules():
+            return [RuleSimple([DONT_CARE], consequent=0)]
+
+        unit = make_unit('u', gapped_schema, sparse_rules, engine_type=engine_type)
+
+        with pytest.raises(ValueError, match="DONT_CARE"):
+            unit.build_engine()
 
 
 # ── run_inference ─────────────────────────────────────────────────────────────

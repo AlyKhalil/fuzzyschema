@@ -10,7 +10,7 @@ from fuzzyschema.engine import (
 )
 from fuzzyschema.mf_params import build_mf_params_class, get_antecedents, get_output_var
 from fuzzyschema.mf_params_t2 import build_it2_mf_params_class, make_it2_from_t1, get_antecedents_t2, get_output_var_t2
-from fuzzyschema.rules import RuleFactory
+from fuzzyschema.rules import DONT_CARE, RuleFactory
 
 
 class TestValidateInput:
@@ -89,6 +89,56 @@ class TestT2FLSEngineToySchema:
         result = engine.run_inference(np.array([[5.0, 0.5]]))
         assert result.shape == (1,)
         assert np.isnan(result[0]) or np.isfinite(result[0])
+
+
+class TestEngineRejectsDontCare:
+    """Both engines require a DENSE rule base at construction. A DONT_CARE (-1)
+    antecedent -- which validate_rules() permits as a sparse-authoring / GA-
+    seeding convenience -- must be rejected here, because ex_fuzzy's RuleBaseT1/
+    RuleBaseT2 have no wildcard-resolution logic and would silently co-fire every
+    rule a wildcard subsumes instead of most-specific-rule-wins."""
+
+    def _t1_bits(self, schema):
+        params = build_mf_params_class(schema)()
+        return dict(
+            antecedents=get_antecedents(schema, params),
+            output_var=get_output_var(schema, params),
+        )
+
+    def _t2_bits(self, schema):
+        T1 = build_mf_params_class(schema)
+        IT2 = build_it2_mf_params_class(schema)
+        it2 = make_it2_from_t1(schema, T1(), delta=0.1, it2_cls=IT2)
+        return dict(
+            antecedents=get_antecedents_t2(schema, it2),
+            output_var=get_output_var_t2(schema, it2),
+        )
+
+    def test_t1_rejects_dont_care(self, toy_schema):
+        # x2 left unspecified -> RuleFactory fills it with DONT_CARE.
+        rules = [RuleFactory(toy_schema).rule(x1=0, out=0)]
+        assert DONT_CARE in [int(a) for a in rules[0].antecedents]
+        with pytest.raises(ValueError, match="DONT_CARE"):
+            T1FLSEngine(rules=rules, **self._t1_bits(toy_schema))
+
+    def test_t2_rejects_dont_care(self, toy_schema):
+        rules = [RuleFactory(toy_schema).rule(x1=0, out=0)]
+        assert DONT_CARE in [int(a) for a in rules[0].antecedents]
+        with pytest.raises(ValueError, match="DONT_CARE"):
+            T2FLSEngine(rules=rules, **self._t2_bits(toy_schema))
+
+    def test_t1_constructs_on_dense_rule_base(self, toy_schema):
+        # Every antecedent specified -> no DONT_CARE -> the guard must NOT fire.
+        rf = RuleFactory(toy_schema)
+        rules = [rf.rule(x1=0, x2=0, out=0), rf.rule(x1=1, x2=2, out=3)]
+        engine = T1FLSEngine(rules=rules, **self._t1_bits(toy_schema))
+        assert isinstance(engine, T1FLSEngine)
+
+    def test_t2_constructs_on_dense_rule_base(self, toy_schema):
+        rf = RuleFactory(toy_schema)
+        rules = [rf.rule(x1=0, x2=0, out=0), rf.rule(x1=1, x2=2, out=3)]
+        engine = T2FLSEngine(rules=rules, **self._t2_bits(toy_schema))
+        assert isinstance(engine, T2FLSEngine)
 
 
 class TestKMEndpointGeneric:
